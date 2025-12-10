@@ -10,7 +10,6 @@ import torch
 import lm_decoder
 from functools import lru_cache
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
 # set up logging
 logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s',level=logging.INFO)
 
@@ -90,7 +89,7 @@ def update_ngram_params(
 
 # function for initializing the OPT model and tokenizer
 def build_opt(
-        model_name='facebook/opt-6.7b',
+        model_name='facebook/opt-6b',
         cache_dir=None,
         device='cuda' if torch.cuda.is_available() else 'cpu',
     ):
