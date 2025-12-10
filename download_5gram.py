@@ -86,7 +86,7 @@ def main():
         filename = file_info["path"]
 
         # Skip everything except languageModel*.*
-        if not filename.startswith("languageModel_5"):
+        if not filename == "languageModel.tar.gz":
             print(f"Skipping {filename}")
             continue
 

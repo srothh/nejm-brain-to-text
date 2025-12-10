@@ -89,7 +89,7 @@ def update_ngram_params(
 
 # function for initializing the OPT model and tokenizer
 def build_opt(
-        model_name='facebook/opt-6b',
+        model_name='facebook/opt-6.7b',
         cache_dir=None,
         device='cuda' if torch.cuda.is_available() else 'cpu',
     ):

@@ -149,11 +149,41 @@ for session, data in test_data.items():
             sentence_label = data['sentence_label'][trial]
             true_seq = data['seq_class_ids'][trial][0:data['seq_len'][trial]]
             true_seq = [LOGIT_TO_PHONEME[p] for p in true_seq]
-
+            total_true_phonemes = 0
+            total_phoneme_ed = 0
+            # Add phoneme errors to better understand individual model performance
             print(f'Sentence label:      {sentence_label}')
             print(f'True sequence:       {" ".join(true_seq)}')
-        print(f'Predicted Sequence:  {" ".join(pred_seq)}')
-        print()
+            print(f'Predicted Sequence:  {" ".join(pred_seq)}')
+            print()
+if eval_type == 'val':
+    total_true_phonemes = 0
+    total_phoneme_ed = 0
+
+    # Iterate over all sessions/trials AFTER pred_seq is complete
+    for sess, sess_data in test_data.items():
+        for trial in range(len(sess_data['logits'])):
+            true_ids = sess_data['seq_class_ids'][trial][0:sess_data['seq_len'][trial]]
+            true_seq = [LOGIT_TO_PHONEME[p] for p in true_ids]
+
+            pred_seq = sess_data['pred_seq'][trial]
+
+            ed = editdistance.eval(true_seq, pred_seq)
+            total_true_phonemes += len(true_seq)
+            total_phoneme_ed += ed
+
+            # Optional: print per-trial PER
+            sentence_label = sess_data['sentence_label'][trial]
+            print(f'Session: {sess}, Block: {sess_data["block_num"][trial]}, Trial: {sess_data["trial_num"][trial]}')
+            print(f'Sentence label:      {sentence_label}')
+            print(f'True sequence:       {" ".join(true_seq)}')
+            print(f'Predicted Sequence:  {" ".join(pred_seq)}')
+            print(f'PER: {ed} / {len(true_seq)} = {ed / len(true_seq):.2f}')
+            print()
+    aggregate_per = 100 * total_phoneme_ed / total_true_phonemes
+    print(f'Total true phonemes: {total_true_phonemes}')
+    print(f'Total phoneme edit distance: {total_phoneme_ed}')
+    print(f'Aggregate Phoneme Error Rate (PER): {aggregate_per:.2f}%\n')
 
 
 # language model inference via redis
