@@ -12,11 +12,11 @@ import sys
 import json
 import pickle
 
-from ..dataset import BrainToTextDataset, train_test_split_indicies
-from ..data_augmentations import gauss_smooth
+from model_training.dataset import BrainToTextDataset, train_test_split_indicies
+from model_training.data_augmentations import gauss_smooth
 from transformers import WhisperForConditionalGeneration, WhisperTokenizer, WhisperProcessor
 import editdistance
-from ..evaluate_model_helpers import remove_punctuation, _extract_transcription
+from model_training.evaluate_model_helpers import remove_punctuation, _extract_transcription
 from transformers.modeling_outputs import BaseModelOutput
 
 from rnn_encoder import RNNEncoder
@@ -28,7 +28,7 @@ torch.set_float32_matmul_precision('high')  # makes float32 matmuls faster on so
 torch.backends.cudnn.deterministic = True  # makes training more reproducible
 torch._dynamo.config.cache_size_limit = 64
 
-from ..rnn_model import GRUDecoder
+from model_training.rnn_model import GRUDecoder
 
 
 class End2EndModel_Trainer:
