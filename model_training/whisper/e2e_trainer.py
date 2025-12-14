@@ -572,18 +572,41 @@ class End2EndModel_Trainer:
                 adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model'][
                     'patch_stride'] + 1).to(torch.int32)
 
-                # Get phoneme predictions
-                logits = self.model(features, day_indicies)
+                # Encode neural activity
+                enc = self.model(features, day_indicies)
+                B, T_enc, _ = enc.shape
 
-                # Calculate CTC Loss
-                loss = self.ctc_loss(
-                    log_probs=torch.permute(logits.log_softmax(2), [1, 0, 2]),
-                    targets=labels,
-                    input_lengths=adjusted_lens,
-                    target_lengths=phone_seq_lens
+                time_ids = torch.arange(T_enc, device=self.device).unsqueeze(0)
+                mask_pad = time_ids >= adjusted_lens.unsqueeze(1)
+                enc = enc.masked_fill(mask_pad.unsqueeze(-1), 0.0)
+                enc_attn = (~mask_pad).long()
+                encoder_outputs = BaseModelOutput(last_hidden_state=enc)
+
+                raw = batch.get('sentence_label', None)
+                if raw is None:
+                    raw = batch['transcriptions']
+                if isinstance(raw, torch.Tensor):
+                    raw = raw.cpu().numpy()
+                sentences = []
+                for s in raw:
+                    if isinstance(s, (bytes, np.bytes_)):
+                        sentences.append(s.decode("utf-8"))
+                    else:
+                        sentences.append(_extract_transcription(np.array(s)))
+
+                tok = self.whisper_tokenizer(
+                    sentences, return_tensors="pt", padding=True, truncation=True
+                ).to(self.device)
+
+                labels = tok.input_ids.clone()
+                labels[tok.attention_mask == 0] = -100
+
+                out = self.whisper(
+                    encoder_outputs=encoder_outputs,
+                    attention_mask=enc_attn,
+                    labels=labels,
                 )
-
-                loss = torch.mean(loss)  # take mean loss over batches
+                loss = out.loss
 
             loss.backward()
 
