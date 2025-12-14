@@ -27,6 +27,9 @@ from omegaconf import OmegaConf
 torch.set_float32_matmul_precision('high')  # makes float32 matmuls faster on some GPUs
 torch.backends.cudnn.deterministic = True  # makes training more reproducible
 torch._dynamo.config.cache_size_limit = 64
+# Silence some warnings about compilation, maybe investigate later
+logging.getLogger("torch.fx.experimental.symbolic_shapes").setLevel(logging.ERROR)
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 
 from model_training.rnn_model import GRUDecoder
 
@@ -124,7 +127,15 @@ class End2EndModel_Trainer:
         # Initialize the model
         # ---- Initialize Whisper (decoder) ----
         whisper_name = self.args.get("whisper_model_name", "openai/whisper-medium")
+        lang = self.args.get("whisper_language", "en")
+        task = self.args.get("whisper_task", "transcribe")
+        
         self.whisper_tokenizer = WhisperTokenizer.from_pretrained(whisper_name)
+        self.whisper_tokenizer.set_prefix_tokens(language=lang, task=task)
+        
+        self.whisper.generation_config.language = lang
+        self.whisper.generation_config.task = task
+
         self.whisper_processor = WhisperProcessor.from_pretrained(whisper_name)
         self.whisper = WhisperForConditionalGeneration.from_pretrained(whisper_name).to(self.device)
 
@@ -530,6 +541,8 @@ class End2EndModel_Trainer:
 
         # Set model to train mode (specificially to make sure dropout layers are engaged)
         self.model.train()
+        # We are not training whisper
+        self.whisper.eval()
 
         # create vars to track performance
         train_losses = []
@@ -644,14 +657,14 @@ class End2EndModel_Trainer:
 
                 # Log info
                 self.logger.info(f'Val batch {i}: ' +
-                                 f'PER (avg): {val_metrics["avg_PER"]:.4f} ' +
-                                 f'CTC Loss (avg): {val_metrics["avg_loss"]:.4f} ' +
+                                 f'WER (avg): {val_metrics["avg_PER"]:.4f} ' +
+                                 f'Loss (avg): {val_metrics["avg_loss"]:.4f} ' +
                                  f'time: {val_step_duration:.3f}')
 
                 if self.args['log_individual_day_val_PER']:
                     for day in val_metrics['day_PERs'].keys():
                         self.logger.info(
-                            f"{self.args['dataset']['sessions'][day]} val PER: {val_metrics['day_PERs'][day]['total_edit_distance'] / val_metrics['day_PERs'][day]['total_seq_length']:0.4f}")
+                            f"{self.args['dataset']['sessions'][day]} val WER: {val_metrics['day_PERs'][day]['total_edit_distance'] / val_metrics['day_PERs'][day]['total_seq_length']:0.4f}")
 
                 # Save metrics
                 val_PERs.append(val_metrics['avg_PER'])
@@ -661,7 +674,7 @@ class End2EndModel_Trainer:
                 # Determine if new best day. Based on if PER is lower, or in the case of a PER tie, if loss is lower
                 new_best = False
                 if val_metrics['avg_PER'] < self.best_val_PER:
-                    self.logger.info(f"New best test PER {self.best_val_PER:.4f} --> {val_metrics['avg_PER']:.4f}")
+                    self.logger.info(f"New best test WER {self.best_val_PER:.4f} --> {val_metrics['avg_PER']:.4f}")
                     self.best_val_PER = val_metrics['avg_PER']
                     self.best_val_loss = val_metrics['avg_loss']
                     new_best = True
@@ -702,7 +715,7 @@ class End2EndModel_Trainer:
         # Log final training steps
         training_duration = time.time() - train_start_time
 
-        self.logger.info(f'Best avg val PER achieved: {self.best_val_PER:.5f}')
+        self.logger.info(f'Best avg val WER achieved: {self.best_val_PER:.5f}')
         self.logger.info(f'Total training time: {(training_duration / 60):.2f} minutes')
 
         # Save final model
@@ -728,6 +741,9 @@ class End2EndModel_Trainer:
         losses = []
 
         day_per = {}
+        examples_to_print = int(self.args.get("val_print_examples", 5))
+        printed = 0
+
         for d in range(len(self.args['dataset']['sessions'])):
             if self.args['dataset']['dataset_probability_val'][d] == 1:
                 day_per[d] = {'total_edit_distance': 0, 'total_seq_length': 0}
@@ -793,15 +809,48 @@ class End2EndModel_Trainer:
                     )
                     loss = out.loss
                     losses.append(float(loss.item()))
+                with torch.autocast(
+                    device_type="cuda",
+                    enabled=self.args["use_amp"],
+                    dtype=torch.bfloat16,
+                ):
 
-                gen_ids = self.whisper.generate(
-                    encoder_outputs=encoder_outputs,
-                    attention_mask=enc_attn,
-                    forced_decoder_ids=self.forced_decoder_ids,
-                    max_new_tokens=self.args.get("max_new_tokens", 64),
-                    num_beams=self.args.get("num_beams", 1),
-                )
+                    gen_ids = self.whisper.generate(
+                        encoder_outputs=encoder_outputs,
+                        attention_mask=enc_attn,
+                        max_new_tokens=self.args.get("max_new_tokens", 64),
+                        num_beams=self.args.get("num_beams", 1),
+                    )
                 hyps = self.whisper_tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+                block_nums = batch.get("block_nums", None)
+                trial_nums = batch.get("trial_nums", None)
+                if isinstance(block_nums, torch.Tensor):
+                    block_nums = block_nums.detach().cpu().tolist()
+                if isinstance(trial_nums, torch.Tensor):
+                    trial_nums = trial_nums.detach().cpu().tolist()
+                
+                for j, (ref, hyp) in enumerate(zip(sentences, hyps)):
+                    if printed >= examples_to_print:
+                        break
+                
+                    ref_clean = remove_punctuation(ref).strip()
+                    hyp_clean = remove_punctuation(hyp).strip()
+                
+                    ref_words = ref_clean.split()
+                    hyp_words = hyp_clean.split()
+                    ed = editdistance.eval(ref_words, hyp_words)
+                    wer = (ed / len(ref_words)) if len(ref_words) > 0 else float("inf")
+                
+                    bnum = block_nums[j] if block_nums is not None and j < len(block_nums) else "?"
+                    tnum = trial_nums[j] if trial_nums is not None and j < len(trial_nums) else "?"
+                
+                    self.logger.info(
+                        f"[VAL EX {printed+1}] day={day} block={bnum} trial={tnum}\n"
+                        f"  REF: {ref_clean}\n"
+                        f"  HYP: {hyp_clean}\n"
+                        f"  WER: {wer:.3f}  (ed={ed}, n_ref={len(ref_words)})"
+                    )
+                    printed += 1
 
                 batch_ed = 0
                 batch_words = 0
