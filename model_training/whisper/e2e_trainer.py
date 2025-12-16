@@ -126,45 +126,49 @@ class End2EndModel_Trainer:
 
         # Initialize the model
         # ---- Initialize Whisper (decoder) ----
+        
         whisper_name = self.args.get("whisper_model_name", "openai/whisper-medium")
-        lang = self.args.get("whisper_language", "en")
-        task = self.args.get("whisper_task", "transcribe")
+        self.lang = self.args.get("whisper_language", "en")
+        self.task = self.args.get("whisper_task", "transcribe")
         
-        self.whisper_tokenizer = WhisperTokenizer.from_pretrained(whisper_name)
-        self.whisper_tokenizer.set_prefix_tokens(language=lang, task=task)
-        
-        self.whisper.generation_config.language = lang
-        self.whisper.generation_config.task = task
-
         self.whisper_processor = WhisperProcessor.from_pretrained(whisper_name)
+        self.whisper_tokenizer = self.whisper_processor.tokenizer
+        self.whisper_tokenizer.set_prefix_tokens(language=self.lang, task=self.task)
+        
         self.whisper = WhisperForConditionalGeneration.from_pretrained(whisper_name).to(self.device)
+        
+        # Recommended for training-style forward passes: disable kv-cache
+        self.whisper.config.use_cache = False  # default is True 
+        
+        # Make generation deterministic about language/task
+        forced = self.whisper_processor.get_decoder_prompt_ids(language=self.lang, task=self.task)
+        self.whisper.generation_config.forced_decoder_ids = forced
 
         if self.args.get("freeze_whisper_decoder", True):
-            for p in self.whisper.model.decoder.parameters():
+            for p in self.whisper.parameters():
                 p.requires_grad = False
 
         self.forced_decoder_ids = self.whisper_processor.get_decoder_prompt_ids(
-            language=self.args.get("whisper_language", "en"),
-            task=self.args.get("whisper_task", "transcribe"),
+            language=self.lang,
+            task=self.task,
         )
 
         # ---- Initialize baseline GRUDecoder exactly as before ----
-        gru_model = GRUDecoder(
-            neural_dim=self.args['model']['n_input_features'],
-            n_units=self.args['model']['n_units'],
-            n_days=len(self.args['dataset']['sessions']),
-            n_classes=self.args['dataset']['n_classes'],
-            rnn_dropout=self.args['model']['rnn_dropout'],
-            input_dropout=self.args['model']['input_network']['input_layer_dropout'],
-            n_layers=self.args['model']['n_layers'],
-            patch_size=self.args['model']['patch_size'],
-            patch_stride=self.args['model']['patch_stride'],
-        )
-
-        # ---- Wrap it with projection Encoder ----
-        proj_in_dim = self.args.get("rnn_proj_in_dim", self.args["dataset"]["n_classes"])
+        from model_training.rnn_model import DayBiGRUEncoder
+        
         d_model = int(self.whisper.config.d_model)
-        self.model = RNNEncoder(gru_model=gru_model, proj_in_dim=proj_in_dim, d_model=d_model)
+        
+        self.model = DayBiGRUEncoder(
+            neural_dim=self.args["model"]["n_input_features"],  # 512
+            hidden_dim=self.args["model"]["n_units"],           # you can reuse this name
+            num_layers=self.args["model"]["n_layers"],
+            n_days=len(self.args["dataset"]["sessions"]),
+            d_model=d_model,
+            rnn_dropout=self.args["model"]["rnn_dropout"],
+            input_dropout=self.args["model"]["input_network"]["input_layer_dropout"],
+            patch_size=self.args["model"]["patch_size"],
+            patch_stride=self.args["model"]["patch_stride"],
+        ).to(self.device)
 
         # Maybe?
         if self.args.get("use_torch_compile", True):
@@ -298,6 +302,24 @@ class End2EndModel_Trainer:
 
         # Send model to device
         self.model.to(self.device)
+
+    def _make_whisper_decoder_inputs(self, sentences):
+        tok = self.whisper_tokenizer(
+            sentences, return_tensors="pt", padding=True, truncation=True
+        ).to(self.device)
+    
+        # Teacher forcing: decoder sees tokens up to t-1, predicts token t
+        decoder_input_ids = tok.input_ids[:, :-1].contiguous()
+        labels = tok.input_ids[:, 1:].clone().contiguous()
+    
+        # mask padding positions in labels (align with labels shape)
+        labels[tok.attention_mask[:, 1:] == 0] = -100
+    
+        prompt_len = len(self.whisper_processor.get_decoder_prompt_ids(language=self.lang, task=self.task))
+        if prompt_len > 1:
+            labels[:, :prompt_len - 1] = -100
+    
+        return tok, decoder_input_ids, labels
 
     def create_optimizer(self):
         '''
@@ -496,9 +518,13 @@ class End2EndModel_Trainer:
         if mode == 'train':
             # add static gain noise
             if self.transform_args['static_gain_std'] > 0:
-                warp_mat = torch.tile(torch.unsqueeze(torch.eye(channels), dim=0), (batch_size, 1, 1))
-                warp_mat += torch.randn_like(warp_mat, device=self.device) * self.transform_args['static_gain_std']
-
+                warp_mat = torch.eye(
+                    channels,
+                    device=features.device,
+                    dtype=features.dtype,
+                ).unsqueeze(0).expand(batch_size, -1, -1).clone()
+            
+                warp_mat = warp_mat + torch.randn_like(warp_mat) * self.transform_args['static_gain_std']
                 features = torch.matmul(features, warp_mat)
 
             # add white noise
@@ -586,7 +612,17 @@ class End2EndModel_Trainer:
                     'patch_stride'] + 1).to(torch.int32)
 
                 # Encode neural activity
-                enc = self.model(features, day_indicies)
+                # If patching enabled, lengths must be the post-patching length (your adjusted_lens)
+                patch_size = self.args["model"]["patch_size"]
+                patch_stride = self.args["model"]["patch_stride"]
+                
+                if patch_size and patch_size > 0:
+                    adjusted_lens = ((n_time_steps - patch_size) / patch_stride + 1).to(torch.int32)
+                    adjusted_lens = torch.clamp(adjusted_lens, min=1)
+                else:
+                    adjusted_lens = n_time_steps.to(torch.int32)
+                
+                enc = self.model(features, day_indicies, lengths=adjusted_lens)
                 B, T_enc, _ = enc.shape
 
                 time_ids = torch.arange(T_enc, device=self.device).unsqueeze(0)
@@ -594,6 +630,14 @@ class End2EndModel_Trainer:
                 enc = enc.masked_fill(mask_pad.unsqueeze(-1), 0.0)
                 enc_attn = (~mask_pad).long()
                 encoder_outputs = BaseModelOutput(last_hidden_state=enc)
+                # Some samples are too long currently for whisper, we need to clamp sadly. In the future, either downsampling or returning timestamps and splitting can be used
+                MAX_SRC = 1500
+                T = encoder_outputs.last_hidden_state.shape[1]
+                if T > MAX_SRC:
+                    encoder_outputs = BaseModelOutput(
+                        last_hidden_state=encoder_outputs.last_hidden_state[:, :MAX_SRC]
+                    )
+                    enc_attn = enc_attn[:, :MAX_SRC]
 
                 raw = batch.get('sentence_label', None)
                 if raw is None:
@@ -607,16 +651,32 @@ class End2EndModel_Trainer:
                     else:
                         sentences.append(_extract_transcription(np.array(s)))
 
-                tok = self.whisper_tokenizer(
-                    sentences, return_tensors="pt", padding=True, truncation=True
-                ).to(self.device)
-
-                labels = tok.input_ids.clone()
-                labels[tok.attention_mask == 0] = -100
+                tok, decoder_input_ids, labels = self._make_whisper_decoder_inputs(sentences)
+                #DEBUG TODO: REMOVE
+                if not hasattr(self, "_logged_whisper_label_example"):
+                    self._logged_whisper_label_example = True
+                
+                    ex_ids = tok.input_ids[0].detach().cpu().tolist()
+                    ex_mask = tok.attention_mask[0].detach().cpu().tolist()
+                
+                    # decode full padded sequence (for debugging)
+                    decoded_full = self.whisper_tokenizer.decode(ex_ids, skip_special_tokens=False)
+                
+                    # decode only the non-pad part
+                    n_valid = int(sum(ex_mask))
+                    decoded_valid = self.whisper_tokenizer.decode(ex_ids[:n_valid], skip_special_tokens=False)
+                
+                    self.logger.info("[WHISPER LABEL CHECK] decoded_full:  " + repr(decoded_full))
+                    self.logger.info("[WHISPER LABEL CHECK] decoded_valid: " + repr(decoded_valid))
+                
+                    # optional: also log the first few raw token ids to spot missing prefix tokens fast
+                    self.logger.info("[WHISPER LABEL CHECK] first 16 token ids: " + str(ex_ids[:16]))
 
                 out = self.whisper(
                     encoder_outputs=encoder_outputs,
                     attention_mask=enc_attn,
+                    decoder_input_ids=decoder_input_ids,
+
                     labels=labels,
                 )
                 loss = out.loss
@@ -769,13 +829,34 @@ class End2EndModel_Trainer:
                     adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model'][
                         'patch_stride'] + 1).to(torch.int32)
 
-                    enc = self.model(features, day_indicies)  # (B, T_enc, d_model)
+                    # If patching enabled, lengths must be the post-patching length (your adjusted_lens)
+                    patch_size = self.args["model"]["patch_size"]
+                    patch_stride = self.args["model"]["patch_stride"]
+                    
+                    if patch_size and patch_size > 0:
+                        adjusted_lens = ((n_time_steps - patch_size) / patch_stride + 1).to(torch.int32)
+                        adjusted_lens = torch.clamp(adjusted_lens, min=1)
+                    else:
+                        adjusted_lens = n_time_steps.to(torch.int32)
+                    
+                    enc = self.model(features, day_indicies, lengths=adjusted_lens)
                     B, T_enc, _ = enc.shape
+                    if not hasattr(self, "_len_debug_done"):
+                        self._len_debug_done = True
+                        self.logger.info(
+                            f"[LEN DEBUG] n_time_steps[0]={int(n_time_steps[0])} "
+                            f"adjusted_lens[0]={int(adjusted_lens[0])} "
+                            f"T_enc={enc.shape[1]}"
+                        )
 
                     time_ids = torch.arange(T_enc, device=self.device).unsqueeze(0)
                     mask_pad = time_ids >= adjusted_lens.unsqueeze(1)
                     enc = enc.masked_fill(mask_pad.unsqueeze(-1), 0.0)
+
+                    assert enc.shape[-1] == self.whisper.config.d_model
+
                     enc_attn = (~mask_pad).long()
+                    assert (enc_attn.sum(dim=1) > 0).all()
 
                     encoder_outputs = BaseModelOutput(last_hidden_state=enc)
 
@@ -794,17 +875,12 @@ class End2EndModel_Trainer:
                         else:
                             sentences.append(_extract_transcription(np.array(s)))
 
-                    tok = self.whisper_tokenizer(
-                        sentences, return_tensors="pt", padding=True, truncation=True
-                    ).to(self.device)
-
-                    labels = tok.input_ids.clone()
-                    # Blank weight
-                    labels[tok.attention_mask == 0] = -100
+                    tok, decoder_input_ids, labels = self._make_whisper_decoder_inputs(sentences)
 
                     out = self.whisper(
                         encoder_outputs=encoder_outputs,
                         attention_mask=enc_attn,
+                        decoder_input_ids=decoder_input_ids,
                         labels=labels,
                     )
                     loss = out.loss
@@ -814,12 +890,26 @@ class End2EndModel_Trainer:
                     enabled=self.args["use_amp"],
                     dtype=torch.bfloat16,
                 ):
+                    MAX_SRC = 1500  # Whisper's limit (as implemented in generate)
+                    T = encoder_outputs.last_hidden_state.shape[1]
+                    if T > MAX_SRC:
+                        encoder_outputs = BaseModelOutput(
+                            last_hidden_state=encoder_outputs.last_hidden_state[:, :MAX_SRC]
+                        )
+                        enc_attn = enc_attn[:, :MAX_SRC]
+
 
                     gen_ids = self.whisper.generate(
                         encoder_outputs=encoder_outputs,
                         attention_mask=enc_attn,
                         max_new_tokens=self.args.get("max_new_tokens", 64),
-                        num_beams=self.args.get("num_beams", 1),
+                        num_beams=self.args.get("num_beams", 5),
+                        no_repeat_ngram_size=3,
+                        repetition_penalty=1.1,
+                        length_penalty=0.0,
+                        eos_token_id=self.whisper_tokenizer.eos_token_id,
+                        pad_token_id=self.whisper_tokenizer.eos_token_id,
+                        
                     )
                 hyps = self.whisper_tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
                 block_nums = batch.get("block_nums", None)

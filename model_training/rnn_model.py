@@ -132,5 +132,136 @@ class GRUDecoder(nn.Module):
             return logits, hidden_states
         
         return logits
-        
+
+
+import torch
+import torch.nn as nn
+
+class DayBiGRUEncoder(nn.Module):
+    """
+    Day-aware bidirectional GRU encoder -> (B, T_enc, d_model)
+    Keeps the baseline's day-specific input alignment, but uses the notebook-style:
+      - pack/pad for variable lengths
+      - biGRU hidden states projected to Whisper d_model
+    """
+
+    def __init__(
+        self,
+        neural_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        n_days: int,
+        d_model: int,
+        rnn_dropout: float = 0.0,
+        input_dropout: float = 0.0,
+        patch_size: int = 0,
+        patch_stride: int = 0,
+    ):
+        super().__init__()
+        self.out_ln = nn.LayerNorm(d_model)
+        self.neural_dim = neural_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.n_days = n_days
+        self.d_model = d_model
+
+        self.patch_size = int(patch_size)
+        self.patch_stride = int(patch_stride)
+
+        # --- Day-specific affine "alignment" layer ---
+        self.day_layer_activation = nn.Softsign()
+        self.day_layer_dropout = nn.Dropout(input_dropout)
+
+        # More GPU/compile-friendly than ParameterList: (n_days, D, D) and (n_days, D)
+        eye = torch.eye(neural_dim).unsqueeze(0).repeat(n_days, 1, 1)
+        self.day_weights = nn.Parameter(eye)                    # (n_days, D, D)
+        self.day_biases  = nn.Parameter(torch.zeros(n_days, neural_dim))  # (n_days, D)
+
+        # --- Optional patching changes the GRU input size ---
+        gru_input_dim = neural_dim
+        if self.patch_size and self.patch_size > 0:
+            gru_input_dim = neural_dim * self.patch_size
+
+        self.gru = nn.GRU(
+            input_size=gru_input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=rnn_dropout if num_layers > 1 else 0.0,
+        )
+
+        # Notebook-style: project hidden states to Whisper d_model
+        self.proj = nn.Linear(2 * hidden_dim, d_model)
+
+        # Learnable initial hidden state for biGRU: (num_layers * 2, 1, hidden_dim)
+        self.h0 = nn.Parameter(torch.zeros(num_layers * 2, 1, hidden_dim))
+        nn.init.xavier_uniform_(self.h0)
+
+        # (Optional) init like baseline
+        for name, param in self.gru.named_parameters():
+            if "weight_hh" in name:
+                nn.init.orthogonal_(param)
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+        nn.init.xavier_uniform_(self.proj.weight)
+
+    def forward(self, x: torch.Tensor, day_idx: torch.Tensor, lengths: torch.Tensor):
+        """
+        x:        (B, T, D) padded neural features
+        day_idx:  (B,) day indices
+        lengths:  (B,) true lengths AFTER patching if patching is enabled
+                           (or raw lengths if patching disabled)
+        returns:  (B, T_enc, d_model)
+        """
+
+        B, T, D = x.shape
+        if day_idx.dim() == 0:
+            day_idx = day_idx.unsqueeze(0)
+
+        # --- Day-specific transform ---
+        W = self.day_weights[day_idx]                 # (B, D, D)
+        b = self.day_biases[day_idx].unsqueeze(1)     # (B, 1, D)
+
+        # x @ W + b
+        x = torch.einsum("btd,bde->bte", x, W) + b
+        x = self.day_layer_activation(x)
+        x = self.day_layer_dropout(x)
+
+        # --- Optional patching/downsampling (matches baseline idea) ---
+        if self.patch_size and self.patch_size > 0:
+            # x: (B, T, D) -> (B, T_p, patch_size, D) -> (B, T_p, patch_size*D)
+            x = x.unfold(dimension=1, size=self.patch_size, step=self.patch_stride)
+            x = x.contiguous().view(B, x.size(1), -1)  # (B, T_p, patch_size*D)
+
+        # --- Pack/pad like notebook ---
+        lengths = lengths.to(dtype=torch.long)
+        lengths = torch.clamp(lengths, min=1)  # pack can't handle zeros
+        lengths_cpu = lengths.detach().cpu()
+
+        h0 = self.h0.to(device=x.device, dtype=x.dtype).expand(self.num_layers * 2, B, self.hidden_dim).contiguous()
+
+        packed = nn.utils.rnn.pack_padded_sequence(x, lengths_cpu, batch_first=True, enforce_sorted=False)
+        packed_out, _ = self.gru(packed, h0)
+        out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True, total_length=x.size(1))
+
+        out = self.proj(out)  # (B, T_enc, d_model)
+        out = self.out_ln(out)
+        return out
+
+
+import torch
+import torch.nn as nn
+
+class DayBiGRUEncoderForPhonemes(nn.Module):
+    def __init__(self, encoder: nn.Module, d_model: int, n_classes: int):
+        super().__init__()
+        self.encoder = encoder
+        self.phoneme_head = nn.Linear(d_model, n_classes)
+        nn.init.xavier_uniform_(self.phoneme_head.weight)
+
+    def forward(self, x, day_idx, lengths, return_features=False):
+        feats = self.encoder(x, day_idx, lengths=lengths)     # (B, T, d_model)
+        logits = self.phoneme_head(feats)                     # (B, T, n_classes)
+        return (logits, feats) if return_features else logits
 
