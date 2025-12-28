@@ -1,12 +1,15 @@
 model:
   n_input_features: 512 # number of input features in the neural data. (2 features per electrode, 256 electrodes)
   n_units: 768 # number of units per GRU layer
-  rnn_dropout: 0.3 # dropout rate for the GRU layers
+  rnn_dropout: 0.2 # <-- OPTIMAL from our sweeps
   rnn_trainable: true # whether the GRU layers are trainable
   n_layers: 5 # number of GRU layers
-  patch_size: 8 # size of the input patches (14 time steps)
-  patch_stride: 2 # stride for the input patches (4 time steps)
+  decoder_type: gru
 
+  patch_size: 14 # size of the input patches (14 time steps)
+  patch_stride: 4 # stride for the input patches (4 time steps)
+
+  # Input network (day-specific)
   input_network:
     n_input_layers: 1 # number of input layers per network (one network for each day)
     input_layer_sizes:
@@ -14,76 +17,105 @@ model:
     input_trainable: true # whether the input layer is trainable
     input_layer_dropout: 0.2 # dropout rate for the input layer
 
+  # --- Explicit "new" model params (to avoid relying on constructor defaults) ---
+  # Optional head (kept OFF in baseline)
+  head_type: "none"        # "none" | "resffn"
+  head_num_blocks: 0
+  head_norm: "none"        # "bn" | "layernorm" | "rmsnorm" | "none"
+  head_dropout: 0.0
+  head_activation: "gelu"
+
+  # Speckled masking (coordinated dropout) - OPTIMAL setting you reported
+  input_speckle_p: 0.10
+  input_speckle_mode: "feature"
+
+  # If present in your GRU signature (otherwise harmless if ignored by OmegaConf in your setup)
+  d_model: 0
+
+  # ResLSTM knobs (unused when decoder_type=gru, kept for compatibility)
+  reslstm_num_blocks: 1
+  reslstm_sublayers_per_block: 2
+  reslstm_lstm_layers: 2
+  reslstm_lstm_dropout: 0.1
+  reslstm_norm: bn            # bn | layernorm | rmsnorm | none
+  reslstm_pre_norm: false
+  reslstm_residual_dropout: 0.0
+
 gpu_number: '0' # GPU number to use for training, formatted as a string (e.g., '0', '1', etc.)
 mode: train
 use_amp: true # whether to use automatic mixed precision (AMP) for training
 
-output_dir: model_training/whisper/trained_models/baseline_rnn # directory to save the trained model and logs
-checkpoint_dir: model_training/whisper/trained_models/baseline_rnn/checkpoint # directory to save checkpoints during training
+output_dir: trained_models/pretrained_rnn # directory to save the trained model and logs
+checkpoint_dir: trained_models/pretrained_rnn/checkpoint # directory to save checkpoints during training
 init_from_checkpoint: false # whether to initialize the model from a checkpoint
-init_checkpoint_path: None # path to the checkpoint to initialize the model from, if any
-save_best_checkpoint: true # whether to save the best checkpoint based on validation metrics
-save_all_val_steps: false # whether to save checkpoints at all validation steps
-save_final_model: false # whether to save the final model after training
-save_val_metrics: true # whether to save validation metrics during training
-early_stopping: false # whether to use early stopping based on validation metrics
-early_stopping_val_steps: 20 # number of validation steps to wait before stopping training if no improvement is seen
+init_checkpoint_path: None # path of the checkpoint to initialize the model from, if any
 
-num_training_batches: 120000 # number of training batches to run
-lr_scheduler_type: cosine # type of learning rate scheduler to use
-lr_max: 2e-4 # maximum learning rate for the main model
-lr_min: 1e-5 # minimum learning rate for the main model
-lr_decay_steps: ${num_training_batches} # number of steps for the learning rate decay
-lr_warmup_steps: 4000 # number of warmup steps for the learning rate scheduler
-lr_max_day: 5e-4 # maximum learning rate for the day specific input layers
-lr_min_day: 1e-5 # minimum learning rate for the day specific input layers
-lr_decay_steps_day: ${num_training_batches} # number of steps for the learning rate decay for the day specific input layers
-lr_warmup_steps_day: 4000 # number of warmup steps for the learning rate scheduler for the day specific input layers
+# Keep disk usage conservative by default
+save_best_checkpoint: true
+save_all_val_steps: false
+save_final_model: false
+save_val_metrics: true
+early_stopping: false
+early_stopping_val_steps: 20
 
-beta0: 0.9 # beta0 parameter for the Adam optimizer
-beta1: 0.999 # beta1 parameter for the Adam optimizer
-epsilon: 1e-8 # epsilon parameter for the Adam optimizer
-weight_decay: 1e-3 # weight decay for the main model
-weight_decay_day: 3e-4 # weight decay for the day specific input layers
-seed: 10 # random seed for reproducibility
-grad_norm_clip_value: 0.5 # gradient norm clipping value
+# --- OPTIMAL LR regime from sweeps ---
+num_training_batches: 120000
+lr_scheduler_type: cosine
+lr_max: 0.003
+lr_min: 0.0001
+lr_decay_steps: ${num_training_batches}
+lr_warmup_steps: 500
 
-batches_per_train_log: 200 # number of batches per training log
-batches_per_val_step: 600 # number of batches per validation step
+lr_max_day: 0.001
+lr_min_day: 0.0001
+lr_decay_steps_day: ${num_training_batches}
+lr_warmup_steps_day: 500
 
-batches_per_save: 0 # number of batches per save
-log_individual_day_val_PER: true # whether to log individual day validation performance
-log_val_skip_logs: false # whether to skip logging validation metrics
-save_val_logits: true # whether to save validation logits
-save_val_data: false # whether to save validation data
+beta0: 0.9
+beta1: 0.999
+epsilon: 0.1
+weight_decay: 0.001
+weight_decay_day: 0
+seed: 10
+grad_norm_clip_value: 5
+
+batches_per_train_log: 200
+batches_per_val_step: 500
+
+batches_per_save: 0
+log_individual_day_val_PER: true
+log_val_skip_logs: false
+save_val_logits: true
+save_val_data: false
 
 dataset:
   data_transforms:
-    white_noise_std: 0.5 # standard deviation of the white noise added to the data
-    constant_offset_std: 0.1 # standard deviation of the constant offset added to the data
-    random_walk_std: 0.01 # standard deviation of the random walk added to the data
-    random_walk_axis: -1 # axis along which the random walk is applied
-    static_gain_std: 0.05 # standard deviation of the static gain applied to the data
-    random_cut: 10 # number of time steps to randomly cut from the beginning of each batch of trials
-    smooth_kernel_size: 25 # size of the smoothing kernel applied to the data
-    smooth_data: false # whether to smooth the data
-    smooth_kernel_std: 2 # standard deviation of the smoothing kernel applied to the data
+    white_noise_std: 1.0
+    constant_offset_std: 0.2
+    random_walk_std: 0.0
+    random_walk_axis: -1
+    static_gain_std: 0.0
+    random_cut: 3
+    smooth_kernel_size: 100
+    smooth_data: true
+    smooth_kernel_std: 2
 
-  neural_dim: 512 # dimensionality of the neural data
-  batch_size: 64 # batch size for training
-  n_classes: 41 # number of classes (phonemes) in the dataset
-  max_seq_elements: 500 # maximum number of sequence elements (phonemes) for any trial
-  days_per_batch: 4 # number of randomly-selected days to include in each batch
-  seed: 1 # random seed for reproducibility
-  num_dataloader_workers: 1 # number of workers for the data loader
-  loader_shuffle: true # whether to shuffle the data loader
-  must_include_days: null # specific days to include in the dataset
-  test_percentage: 0.1 # percentage of data to use for testing
-  feature_subset: null # specific features to include in the dataset
+  neural_dim: 512
+  batch_size: 32
+  n_classes: 41
+  max_seq_elements: 500
+  days_per_batch: 4
+  seed: 10
+  num_dataloader_workers: 1
+  loader_shuffle: false
+  must_include_days: null
+  test_percentage: 0.1
+  feature_subset: null
 
-  dataset_dir: data/hdf5_data_final # directory containing the dataset
-  bad_trials_dict: null # dictionary of bad trials to exclude from the dataset
-  sessions: # list of sessions to include in the dataset
+  dataset_dir: ../data/hdf5_data_final # directory containing the dataset
+  bad_trials_dict: null
+
+  sessions:
   - t15.2023.08.11
   - t15.2023.08.13
   - t15.2023.08.18
@@ -129,8 +161,9 @@ dataset:
   - t15.2025.03.16
   - t15.2025.03.30
   - t15.2025.04.13
-  dataset_probability_val: # probability of including a trial in the validation set (0 or 1)
-  - 0 # no val or test data from this day
+
+  dataset_probability_val:
+  - 0
   - 1
   - 1
   - 1
@@ -158,16 +191,12 @@ dataset:
   - 1
   - 1
   - 1
-  - 0 # no val or test data from this day
+  - 0
   - 1
   - 1
   - 1
-  - 0 # no val or test data from this day
-  - 0 # no val or test data from this day
-  - 1
-  - 1
-  - 1
-  - 1
+  - 0
+  - 0
   - 1
   - 1
   - 1
@@ -175,3 +204,33 @@ dataset:
   - 1
   - 1
   - 1
+  - 1
+  - 1
+  - 1
+  - 1
+
+wandb:
+  enabled: false
+  project: brain2text
+  run_name: gru_baseline
+  tags: ["gru", "baseline_opt", "cosine", "warmup500", "dropout0p2", "speckleFeat_p010", "seed10", "wer1024"]
+
+eval:
+  compute_wer: true
+  reorder_mode: identity
+  wer_tag: "1gram"
+  wer_every_val_steps: 1
+  wer_max_trials: 1024
+
+  lm_dir: "assets/lm/openwebtext_1gram_lm_sil"
+
+  max_active: 7000
+  min_active: 200
+  beam: 15.0
+  lattice_beam: 8.0
+  ctc_blank_skip_threshold: 0.95
+  length_penalty: 0.0
+  acoustic_scale: 0.35
+  nbest: 50
+  blank_penalty: 90.0
+  sil_index: 40

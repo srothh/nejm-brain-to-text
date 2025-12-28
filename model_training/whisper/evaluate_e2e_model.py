@@ -29,7 +29,7 @@ from model_training.evaluate_model_helpers import (
 )
 
 # encoder used in your trainer
-from model_training.rnn_model import DayBiGRUEncoder
+from model_training.rnn_model import DayBiGRUEncoder, GRUEncoder
 
 
 # argument parser for command line arguments (baseline style)
@@ -95,24 +95,55 @@ whisper.generation_config.forced_decoder_ids = forced
 whisper.eval()
 
 d_model = int(whisper.config.d_model)
-model = DayBiGRUEncoder(
-    neural_dim=model_args["model"]["n_input_features"],
-    hidden_dim=model_args["model"]["n_units"],
-    num_layers=model_args["model"]["n_layers"],
+model = GRUEncoder(
+    neural_dim=model_args["model"]["n_input_features"],      # 512
+    n_units=model_args["model"]["n_units"],                  # 768
     n_days=len(model_args["dataset"]["sessions"]),
-    d_model=d_model,
+    n_classes=int(model_args["dataset"].get("n_classes", 41)),  # unused for enc output, but must exist
     rnn_dropout=model_args["model"]["rnn_dropout"],
     input_dropout=model_args["model"]["input_network"]["input_layer_dropout"],
+    n_layers=model_args["model"]["n_layers"],
     patch_size=model_args["model"]["patch_size"],
     patch_stride=model_args["model"]["patch_stride"],
+
+    head_type=model_args["model"].get("head_type", "none"),
+    head_num_blocks=model_args["model"].get("head_num_blocks", 0),
+    head_norm=model_args["model"].get("head_norm", "none"),
+    head_dropout=model_args["model"].get("head_dropout", 0.0),
+    head_activation=model_args["model"].get("head_activation", "gelu"),
+
+    input_speckle_p=model_args["model"].get("input_speckle_p", 0.0),
+    input_speckle_mode=model_args["model"].get("input_speckle_mode", "feature"),
+
+    d_model=d_model,
 ).to(device)
 model.eval()
+import torch.nn as nn
+
+n_phonemes = int(model_args.get("n_phonemes", 41))
+ctc_fuse_alpha = float(model_args.get("ctc_fuse_alpha", model_args.get("ctc_fuse_alpha_initial", 0.0)))
+
+phoneme_head = nn.Linear(d_model, n_phonemes).to(device).eval()
+ctc_to_dmodel = nn.Linear(n_phonemes, d_model, bias=False).to(device).eval()
 
 # load model weights (baseline-style: load best_checkpoint and strip prefixes)
 checkpoint_path = os.path.join(model_path, 'checkpoint/best_checkpoint')
 checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+if "phoneme_head_state_dict" in checkpoint:
+    phoneme_head.load_state_dict(checkpoint["phoneme_head_state_dict"], strict=True)
+    print("Loaded phoneme_head from checkpoint")
+
+if "ctc_to_dmodel_state_dict" in checkpoint:
+    ctc_to_dmodel.load_state_dict(checkpoint["ctc_to_dmodel_state_dict"], strict=True)
+    print("Loaded ctc_to_dmodel from checkpoint")
 
 state = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+if "whisper_state_dict" in checkpoint:
+    whisper.load_state_dict(checkpoint["whisper_state_dict"], strict=True)
+    print("Loaded Whisper weights from checkpoint")
+else:
+    print("No whisper_state_dict in checkpoint; using pretrained Whisper")
+
 new_state = {}
 for k, v in state.items():
     k2 = k.replace("module.", "").replace("_orig_mod.", "")
@@ -190,6 +221,10 @@ with tqdm(total=total_test_trials, desc='Predicting phoneme sequences', unit='tr
                         day_idx=torch.tensor([input_layer], device=device, dtype=torch.long),
                         lengths=lengths,
                     )
+                    phon_logits = phoneme_head(enc)                 # (B, T, n_phonemes)
+                    phon_probs = phon_logits.softmax(dim=-1)        
+                    enc = enc + (ctc_fuse_alpha * ctc_to_dmodel(phon_probs))
+
 
                     _, T_enc, _ = enc.shape
                     time_ids = torch.arange(T_enc, device=device).unsqueeze(0)

@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import DataLoader
+import torch.nn as nn
 from torch.optim.lr_scheduler import LambdaLR
 import random
 import time
@@ -11,6 +12,7 @@ import logging
 import sys
 import json
 import pickle
+from collections import Counter
 
 from model_training.dataset import BrainToTextDataset, train_test_split_indicies
 from model_training.data_augmentations import gauss_smooth
@@ -31,7 +33,7 @@ torch._dynamo.config.cache_size_limit = 64
 logging.getLogger("torch.fx.experimental.symbolic_shapes").setLevel(logging.ERROR)
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 
-from model_training.rnn_model import GRUDecoder
+from model_training.rnn_model import GRUDecoder, GRUEncoder
 
 
 class End2EndModel_Trainer:
@@ -128,47 +130,132 @@ class End2EndModel_Trainer:
         # ---- Initialize Whisper (decoder) ----
         
         whisper_name = self.args.get("whisper_model_name", "openai/whisper-medium")
-        self.lang = self.args.get("whisper_language", "en")
-        self.task = self.args.get("whisper_task", "transcribe")
         
-        self.whisper_processor = WhisperProcessor.from_pretrained(whisper_name)
+        self.whisper_processor = WhisperProcessor.from_pretrained(whisper_name, language="English", task="transcribe")
         self.whisper_tokenizer = self.whisper_processor.tokenizer
-        self.whisper_tokenizer.set_prefix_tokens(language=self.lang, task=self.task)
         
         self.whisper = WhisperForConditionalGeneration.from_pretrained(whisper_name).to(self.device)
         
-        # Recommended for training-style forward passes: disable kv-cache
         self.whisper.config.use_cache = False  # default is True 
         
         # Make generation deterministic about language/task
-        forced = self.whisper_processor.get_decoder_prompt_ids(language=self.lang, task=self.task)
-        self.whisper.generation_config.forced_decoder_ids = forced
-
+        # GC approach somehow does not work
+        self.whisper.generation_config.language = "english"
+        self.whisper.generation_config.task = "transcribe"
+        gc = self.whisper.generation_config
+        gc.language = None
+        gc.task = None
+        
+        forced = self.whisper_processor.get_decoder_prompt_ids(language="english", task="transcribe")
+        gc.forced_decoder_ids = forced  
         if self.args.get("freeze_whisper_decoder", True):
             for p in self.whisper.parameters():
                 p.requires_grad = False
 
-        self.forced_decoder_ids = self.whisper_processor.get_decoder_prompt_ids(
-            language=self.lang,
-            task=self.task,
-        )
-
-        # ---- Initialize baseline GRUDecoder exactly as before ----
+        # Try some unfreezing, only some cross attention for now
+        unfreeze_layer_count = 0
+        for name, param in self.whisper.named_parameters():
+            if name.startswith("model.decoder.layers."):
+                layer_id = int(name.split(".")[3])
+                if layer_id >= (len(self.whisper.model.decoder.layers) - unfreeze_layer_count):
+                    if (".encoder_attn." in name) or (".encoder_attn_layer_norm." in name):
+                        param.requires_grad = True
+        # Check this
+        trainable = [(n, p.numel()) for n, p in self.whisper.named_parameters() if p.requires_grad]
+        print("trainable whisper params:", len(trainable), "tensors",
+      " | total:", sum(x[1] for x in trainable))
+        self.trainable_whisper_params = [p for p in self.whisper.parameters() if p.requires_grad]
+        # ---- Initialize baseline GRUDecoder ----
         from model_training.rnn_model import DayBiGRUEncoder
         
         d_model = int(self.whisper.config.d_model)
         
-        self.model = DayBiGRUEncoder(
-            neural_dim=self.args["model"]["n_input_features"],  # 512
-            hidden_dim=self.args["model"]["n_units"],           # you can reuse this name
-            num_layers=self.args["model"]["n_layers"],
+        def _clean_state_dict_keys(sd: dict) -> dict:
+            out = {}
+            for k, v in sd.items():
+                k = k.replace("module.", "").replace("_orig_mod.", "")
+                # allow either encoder.* or raw keys
+                if k.startswith("encoder."):
+                    k = k[len("encoder."):]
+                out[k] = v
+            return out
+        
+        pretrained_path = self.args.get(
+            "pretrained_encoder_checkpoint",
+            "model_training/trained_models/pretrained_rnn/checkpoint/best_checkpoint",
+        )
+        
+        
+        self.model = GRUEncoder(
+            neural_dim=self.args["model"]["n_input_features"],      # 512
+            n_units=self.args["model"]["n_units"],                  # 768
             n_days=len(self.args["dataset"]["sessions"]),
-            d_model=d_model,
+            n_classes=int(self.args["dataset"].get("n_classes", 41)),  # unused for enc output, but must exist
             rnn_dropout=self.args["model"]["rnn_dropout"],
             input_dropout=self.args["model"]["input_network"]["input_layer_dropout"],
+            n_layers=self.args["model"]["n_layers"],
             patch_size=self.args["model"]["patch_size"],
             patch_stride=self.args["model"]["patch_stride"],
+        
+            head_type=self.args["model"].get("head_type", "none"),
+            head_num_blocks=self.args["model"].get("head_num_blocks", 0),
+            head_norm=self.args["model"].get("head_norm", "none"),
+            head_dropout=self.args["model"].get("head_dropout", 0.0),
+            head_activation=self.args["model"].get("head_activation", "gelu"),
+        
+            input_speckle_p=self.args["model"].get("input_speckle_p", 0.0),
+            input_speckle_mode=self.args["model"].get("input_speckle_mode", "feature"),
+        
+            d_model=d_model,
         ).to(self.device)
+        # Phoneme projection training experiment start
+        self.n_phonemes = int(self.args.get("n_phonemes", 41))
+        self.phoneme_head = nn.Linear(d_model, self.n_phonemes).to(self.device)
+        nn.init.xavier_uniform_(self.phoneme_head.weight)
+        # project back
+        self.ctc_to_dmodel = nn.Linear(self.n_phonemes, d_model, bias=False).to(self.device)
+        self.ctc_loss_weight = float(self.args.get("ctc_loss_weight", 0.0))     # auxiliary loss weight
+        self.ctc_fuse_alpha  = float(self.args.get("ctc_fuse_alpha_initial",0.0))      # how much to add into enc
+        self.detach_ctc_features = bool(self.args.get("detach_ctc_features", True))
+        self.ctc_loss = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=False)
+        def _clean_state_dict_keys(sd: dict) -> dict:
+            out = {}
+            for k, v in sd.items():
+                k = k.replace("module.", "").replace("_orig_mod.", "")
+                out[k] = v
+            return out
+
+        pretrained_path = self.args.get(
+            "pretrained_encoder_checkpoint",
+            "model_training/trained_models/pretrained_rnn/checkpoint/best_checkpoint",
+        )
+        
+        ckpt = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+        sd = ckpt.get("model_state_dict", ckpt)
+        sd = _clean_state_dict_keys(sd)
+        
+        # If checkpoint is the WRAPPER, keys look like: encoder.* and phoneme_head.*
+        if any(k.startswith("encoder.") for k in sd.keys()):
+            enc_sd = {k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")}
+            ph_sd  = {k[len("phoneme_head."):]: v for k, v in sd.items() if k.startswith("phoneme_head.")}
+        else:
+            # fallback: checkpoint might already be encoder-only
+            enc_sd = sd
+            ph_sd = None
+        
+        # Load encoder weights
+        self.model.load_state_dict(enc_sd, strict=True)
+        self.logger.info(f"Loaded pretrained encoder from: {pretrained_path}")
+        
+        # Load pretrained phoneme head weights (if present)
+        if ph_sd is not None and len(ph_sd) > 0:
+            self.phoneme_head.load_state_dict(ph_sd, strict=True)
+            self.logger.info("Loaded pretrained phoneme_head weights too.")
+        
+
+        # experiment end
+        #enc_state = {k.replace("encoder.", "", 1): v for k, v in phoneme_checkpoint.items() if k.startswith("encoder.")}
+        #self.model.load_state_dict(enc_state, strict=True)
 
         # Maybe?
         if self.args.get("use_torch_compile", True):
@@ -176,7 +263,6 @@ class End2EndModel_Trainer:
             self.model = torch.compile(self.model)
 
         self.model.to(self.device)
-
 
         self.logger.info(f"Initialized RNN decoding model")
 
@@ -315,7 +401,7 @@ class End2EndModel_Trainer:
         # mask padding positions in labels (align with labels shape)
         labels[tok.attention_mask[:, 1:] == 0] = -100
     
-        prompt_len = len(self.whisper_processor.get_decoder_prompt_ids(language=self.lang, task=self.task))
+        prompt_len = len(self.whisper_processor.get_decoder_prompt_ids())
         if prompt_len > 1:
             labels[:, :prompt_len - 1] = -100
     
@@ -329,7 +415,13 @@ class End2EndModel_Trainer:
 
         Day weights should have a separate learning rate
         '''
-        named = list(self.model.named_parameters())
+        # named = list(self.model.named_parameters()) Non-phoneme fuse
+    
+        named = (
+            list(self.model.named_parameters())
+            + [(f"phoneme_head.{n}", p) for n, p in self.phoneme_head.named_parameters()]
+            + [(f"ctc_to_dmodel.{n}", p) for n, p in self.ctc_to_dmodel.named_parameters()]
+        )
 
         bias_params = [p for name, p in named if name.endswith("bias")]
         day_params = [p for name, p in self.model.named_parameters() if 'day_' in name]
@@ -343,12 +435,15 @@ class End2EndModel_Trainer:
                 {'params': bias_params, 'weight_decay': 0, 'group_type': 'bias'},
                 {'params': day_params, 'lr': self.args['lr_max_day'], 'weight_decay': self.args['weight_decay_day'],
                  'group_type': 'day_layer'},
-                {'params': other_params, 'group_type': 'other'}
+                {'params': other_params, 'group_type': 'other'},
+                {"params": self.trainable_whisper_params, 'group_type': 'whisper'}
+
             ]
         else:
             param_groups = [
                 {'params': bias_params, 'weight_decay': 0, 'group_type': 'bias'},
-                {'params': other_params, 'group_type': 'other'}
+                {'params': other_params, 'group_type': 'other'},
+                {"params": self.trainable_whisper_params, 'group_type': 'whisper'}
             ]
 
         optim = torch.optim.AdamW(
@@ -396,7 +491,34 @@ class End2EndModel_Trainer:
             # After cosine decay is complete, maintain min_lr_ratio
             return min_lr_ratio
 
-        if len(optim.param_groups) == 3:
+
+        if len(optim.param_groups) == 4:
+            lr_lambdas = [
+                lambda step: lr_lambda(
+                    step,
+                    lr_min / lr_max,
+                    lr_decay_steps,
+                    lr_warmup_steps),  # biases
+                lambda step: lr_lambda(
+                    step,
+                    lr_min_day / lr_max_day,
+                    lr_decay_steps_day,
+                    lr_warmup_steps_day,
+                ),  # day params
+                lambda step: lr_lambda(
+                    step,
+                    lr_min / lr_max,
+                    lr_decay_steps,
+                    lr_warmup_steps),  # rest of model weights
+                lambda step: lr_lambda(
+                    step,
+                    lr_min / lr_max,
+                    lr_decay_steps,
+                    lr_warmup_steps),  # whisper layers, for now keep standard
+
+            ]
+
+        elif len(optim.param_groups) == 3:
             lr_lambdas = [
                 lambda step: lr_lambda(
                     step,
@@ -444,6 +566,14 @@ class End2EndModel_Trainer:
         self.learning_rate_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.best_val_PER = checkpoint['val_PER']  # best phoneme error rate
         self.best_val_loss = checkpoint['val_loss'] if 'val_loss' in checkpoint.keys() else torch.inf
+        if "whisper_state_dict" in checkpoint:
+            self.whisper.load_state_dict(checkpoint["whisper_state_dict"])
+        
+        if "phoneme_head_state_dict" in checkpoint:
+            self.phoneme_head.load_state_dict(checkpoint["phoneme_head_state_dict"])
+        
+        if "ctc_to_dmodel_state_dict" in checkpoint:
+            self.ctc_to_dmodel.load_state_dict(checkpoint["ctc_to_dmodel_state_dict"])
 
         self.model.to(self.device)
 
@@ -461,13 +591,15 @@ class End2EndModel_Trainer:
         '''
 
         checkpoint = {
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.learning_rate_scheduler.state_dict(),
-            'val_PER': PER,
-            'val_loss': loss
+          "model_state_dict": self.model.state_dict(),
+          "whisper_state_dict": self.whisper.state_dict(),
+          "optimizer_state_dict": self.optimizer.state_dict(),
+          "scheduler_state_dict": self.learning_rate_scheduler.state_dict(),
+          "phoneme_head_state_dict": self.phoneme_head.state_dict(),
+          "ctc_to_dmodel_state_dict": self.ctc_to_dmodel.state_dict(),
+          "val_PER": PER,
+          "val_loss": loss,
         }
-
         torch.save(checkpoint, save_path)
 
         self.logger.info("Saved model to checkpoint: " + save_path)
@@ -588,7 +720,7 @@ class End2EndModel_Trainer:
 
         # train for specified number of batches
         for i, batch in enumerate(self.train_loader):
-
+                
             self.model.train()
             self.optimizer.zero_grad()
 
@@ -597,7 +729,7 @@ class End2EndModel_Trainer:
 
             # Move data to device
             features = batch['input_features'].to(self.device)
-            labels = batch['seq_class_ids'].to(self.device)
+            phone_labels = batch['seq_class_ids'].to(self.device)
             n_time_steps = batch['n_time_steps'].to(self.device)
             phone_seq_lens = batch['phone_seq_lens'].to(self.device)
             day_indicies = batch['day_indicies'].to(self.device)
@@ -623,6 +755,12 @@ class End2EndModel_Trainer:
                     adjusted_lens = n_time_steps.to(torch.int32)
                 
                 enc = self.model(features, day_indicies, lengths=adjusted_lens)
+                phon_logits = self.phoneme_head(enc)              # (B, T, n_phonemes)
+                phon_probs = phon_logits.softmax(dim=-1)
+                if self.detach_ctc_features:
+                    phon_probs = phon_probs.detach()
+                enc = enc + (self.ctc_fuse_alpha * self.ctc_to_dmodel(phon_probs))
+
                 B, T_enc, _ = enc.shape
 
                 time_ids = torch.arange(T_enc, device=self.device).unsqueeze(0)
@@ -651,7 +789,7 @@ class End2EndModel_Trainer:
                     else:
                         sentences.append(_extract_transcription(np.array(s)))
 
-                tok, decoder_input_ids, labels = self._make_whisper_decoder_inputs(sentences)
+                tok, decoder_input_ids, whisper_labels = self._make_whisper_decoder_inputs(sentences)
                 #DEBUG TODO: REMOVE
                 if not hasattr(self, "_logged_whisper_label_example"):
                     self._logged_whisper_label_example = True
@@ -677,19 +815,43 @@ class End2EndModel_Trainer:
                     attention_mask=enc_attn,
                     decoder_input_ids=decoder_input_ids,
 
-                    labels=labels,
+                    labels=whisper_labels,
                 )
-                loss = out.loss
+                # loss = out.loss Non-phoneme
+                whisper_loss = out.loss
+                ctc_loss = self.ctc_loss(
+                    log_probs=phon_logits.float().log_softmax(dim=-1).transpose(0, 1),  # (T,B,C)
+                    targets=phone_labels,
+                    input_lengths=adjusted_lens,
+                    target_lengths=phone_seq_lens,
+                )
+                whisper_loss_item = float(whisper_loss.detach().item())
+                ctc_loss_item = float(ctc_loss.detach().item())
+
+                loss = whisper_loss + (self.ctc_loss_weight * ctc_loss)
+                
 
             loss.backward()
 
             # Clip gradient
             if self.args['grad_norm_clip_value'] > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
-                                                           max_norm=self.args['grad_norm_clip_value'],
-                                                           error_if_nonfinite=True,
-                                                           foreach=True
-                                                           )
+                # grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                #                                           max_norm=self.args['grad_norm_clip_value'],
+                #                                           error_if_nonfinite=True,
+                #                                           foreach=True
+                #                                           )
+                to_clip = (
+                    list(self.model.parameters())
+                    + list(self.phoneme_head.parameters())
+                    + list(self.ctc_to_dmodel.parameters())
+                    + list(self.trainable_whisper_params)  # empty if all frozen, fine
+                )
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    to_clip,
+                    max_norm=self.args["grad_norm_clip_value"],
+                    error_if_nonfinite=True,
+                    foreach=True,
+                )
 
             self.optimizer.step()
             self.learning_rate_scheduler.step()
@@ -700,10 +862,16 @@ class End2EndModel_Trainer:
 
             # Incrementally log training progress
             if i % self.args['batches_per_train_log'] == 0:
-                self.logger.info(f'Train batch {i}: ' +
-                                 f'loss: {(loss.detach().item()):.2f} ' +
-                                 f'grad norm: {grad_norm:.2f} '
-                                 f'time: {train_step_duration:.3f}')
+                if i % self.args['batches_per_train_log'] == 0:
+                    self.logger.info(
+                        f"Train batch {i}: "
+                        f"loss: {loss.detach().item():.4f} "
+                        f"whisper: {whisper_loss_item:.4f} "
+                        f"ctc: {ctc_loss_item:.4f} "
+                        f"(ctc*w={self.ctc_loss_weight:.3f} -> {self.ctc_loss_weight*ctc_loss_item:.4f}) "
+                        f"grad norm: {grad_norm:.2f} "
+                        f"time: {train_step_duration:.3f}"
+                    )
 
             # Incrementally run a test step
             if i % self.args['batches_per_val_step'] == 0 or i == ((self.args['num_training_batches'] - 1)):
@@ -812,6 +980,8 @@ class End2EndModel_Trainer:
             features = batch['input_features'].to(self.device)
             n_time_steps = batch['n_time_steps'].to(self.device)
             day_indicies = batch['day_indicies'].to(self.device)
+            phone_labels = batch['seq_class_ids'].to(self.device)
+            phone_seq_lens = batch['phone_seq_lens'].to(self.device)
 
             day = day_indicies[0].item()
             if self.args['dataset']['dataset_probability_val'][day] == 0:
@@ -840,6 +1010,15 @@ class End2EndModel_Trainer:
                         adjusted_lens = n_time_steps.to(torch.int32)
                     
                     enc = self.model(features, day_indicies, lengths=adjusted_lens)
+                    # Phoneme experiment start
+                    phon_logits = self.phoneme_head(enc)
+                    phon_probs = phon_logits.softmax(dim=-1)
+                    if self.detach_ctc_features:
+                        phon_probs = phon_probs.detach()
+                    
+                    enc = enc + (self.ctc_fuse_alpha * self.ctc_to_dmodel(phon_probs))
+                    # Phoneme experiment end
+
                     B, T_enc, _ = enc.shape
                     if not hasattr(self, "_len_debug_done"):
                         self._len_debug_done = True
@@ -875,15 +1054,23 @@ class End2EndModel_Trainer:
                         else:
                             sentences.append(_extract_transcription(np.array(s)))
 
-                    tok, decoder_input_ids, labels = self._make_whisper_decoder_inputs(sentences)
+                    tok, decoder_input_ids, whisper_labels = self._make_whisper_decoder_inputs(sentences)
 
                     out = self.whisper(
                         encoder_outputs=encoder_outputs,
                         attention_mask=enc_attn,
                         decoder_input_ids=decoder_input_ids,
-                        labels=labels,
+                        labels=whisper_labels,
                     )
-                    loss = out.loss
+                    # loss = out.loss Non-phoneme
+                    whisper_loss = out.loss
+                    ctc_loss = self.ctc_loss(
+                        log_probs=phon_logits.float().log_softmax(dim=-1).transpose(0, 1),  # (T, B, C)
+                        targets=phone_labels,
+                        input_lengths=adjusted_lens,
+                        target_lengths=phone_seq_lens,
+                    )
+                    loss = whisper_loss + (self.ctc_loss_weight * ctc_loss)
                     losses.append(float(loss.item()))
                 with torch.autocast(
                     device_type="cuda",
@@ -902,6 +1089,7 @@ class End2EndModel_Trainer:
                     gen_ids = self.whisper.generate(
                         encoder_outputs=encoder_outputs,
                         attention_mask=enc_attn,
+                        forced_decoder_ids=self.whisper.generation_config.forced_decoder_ids,
                         max_new_tokens=self.args.get("max_new_tokens", 64),
                         num_beams=self.args.get("num_beams", 5),
                         no_repeat_ngram_size=3,

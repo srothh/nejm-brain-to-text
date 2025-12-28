@@ -18,3 +18,6 @@ class RNNEncoder(nn.Module):
             logits, st = out
             return self.proj(logits), st
         return self.proj(out)
+
+
+
